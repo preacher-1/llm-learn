@@ -1,5 +1,6 @@
 from typing import Optional, Tuple
 from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
 
 
 class MyModelConfig(PretrainedConfig):
@@ -12,7 +13,7 @@ class MyModelConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_dim: int = 512,
-        intermediate_size: int = None,
+        intermediate_size: int = 1365,  # 512*8/3
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -20,16 +21,16 @@ class MyModelConfig(PretrainedConfig):
         vocab_size: int = 6400,
         rms_norm_eps: float = 1e-05,
         rope_theta: int = 1000000,
+        partial_rotary_factor: float = 0.5,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
         ############ MoE ############
-        use_moe: bool = False,
-        num_experts_per_tok: int = 2,
-        n_routed_experts: int = 4,
-        n_shared_experts: int = 1,
-        scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
+        use_moe: bool = True,
+        num_experts_per_tok: int = 2,  # 每个token路由到的专家数量
+        n_routed_experts: int = 8,  # 总的路由专家数量
+        n_shared_experts: int = 1,  # 共享专家数量
+        moe_intermediate_size: Optional[int] = None,  # MoE层的intermediate_size，如果为None则在类中计算
+        bias_update_speed: float = 0.001,  # 路由分数偏置的更新速度
         norm_topk_prob: bool = True,
         **kwargs,
     ):
@@ -54,10 +55,9 @@ class MyModelConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
-        self.seq_aux = seq_aux
+        self.moe_intermediate_size = moe_intermediate_size
+        self.bias_update_speed = bias_update_speed
         self.norm_topk_prob = norm_topk_prob
-        self.aux_loss_alpha = aux_loss_alpha
-        self.scoring_func = scoring_func
 
         self.rope_scaling = (
             {
@@ -233,3 +233,157 @@ class Attention(nn.Module):
         attn_output = self.o_proj(attn_output)  # (bsz, seq_len, hidden_dim)
 
         return attn_output, past_key_values
+
+
+class FFN(nn.Module):
+    def __init__(self, config: MyModelConfig, intermediate_size: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.hidden_dim = config.hidden_dim
+        intermediate_size = (
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
+
+        self.up_gate_proj = nn.Linear(
+            self.hidden_dim, self.intermediate_size * 2, bias=False
+        )
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
+
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states: (batch_size, seq_len, hidden_dim)
+        up, gate = self.up_gate_proj(hidden_states).chunk(2, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
+
+
+class MoeRouter(nn.Module):
+    def __init__(self, config: MyModelConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.n_routed_experts
+        self.n_routed_experts = config.n_routed_experts
+        self.n_group = config.n_group
+        self.norm_topk_prob = config.norm_topk_prob
+
+        self.weight = nn.Parameter(
+            torch.randn(self.n_routed_experts, config.hidden_dim)
+        )  # (n_routed_experts, hidden_dim)
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(self.n_routed_experts, dtype=torch.float32),
+        )
+        # 累积当前 step 内各专家被选中的 token 数
+        # persistent=False：不需要保存进 checkpoint，每 step 重置
+        self.register_buffer(
+            "_expert_load_accum",
+            torch.zeros(self.n_routed_experts, dtype=torch.float32),
+            persistent=False,
+        )
+        self.bias_update_speed = config.bias_update_speed
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # hidden_states: (batch_size, seq_len, hidden_dim)
+        bsz, seq_len, _ = hidden_states.shape
+        hidden_states = hidden_states.view(bsz * seq_len, -1)  # (bsz*seq_len, hidden_dim)
+
+        # 计算路由分数
+        scores = nn.functional.linear(
+            hidden_states.type(torch.float32), self.weight.type(torch.float32)
+        )  # (bsz*seq_len, n_routed_experts)
+        scores = scores.sigmoid()
+
+        # 加上负载均衡偏置
+        scores_for_choice = scores + self.e_score_correction_bias
+        _, top_k_index = torch.topk(scores_for_choice, k=self.top_k, dim=-1)
+        weights = scores.gather(-1, top_k_index)  # (bsz*seq_len, top_k)
+        if self.norm_topk_prob:
+            weights_sum = weights.sum(dim=-1, keepdim=True)
+            weights = weights / (weights_sum + 1e-10)
+        # weights = weights * self.route_scale
+        return weights.type_as(hidden_states), top_k_index
+
+    def update_bias(self):
+        # 根据当前 step 内各专家被选中的 token 数来更新路由分数偏置
+        with torch.no_grad():
+            load = self._expert_load_accum  # (n_routed_experts,)
+            mean_load = load.mean()
+            # 分配固定的正负更新量而不依赖于具体的负载差值大小
+            delta = torch.where(
+                self._expert_load_accum > mean_load,
+                torch.full_like(self._expert_load_accum, -self.bias_update_speed),
+                torch.full_like(self._expert_load_accum, self.bias_update_speed),
+            )
+            self.e_score_correction_bias += delta
+            self._expert_load_accum.zero_()  # 重置累积
+
+
+class MoeExpert(nn.Module):
+    """
+    单个专家的前馈网络
+    """
+
+    def __init__(self, config: MyModelConfig):
+        super().__init__()
+        self.config = config
+        self.n_routed_experts = config.n_routed_experts
+        self.hidden_dim = config.hidden_dim
+        if config.moe_intermediate_size is not None:
+            self.intermediate_size = config.moe_intermediate_size
+        else:
+            self.intermediate_size = config.intermediate_size // config.n_routed_experts
+
+        self.up_gate_proj = nn.Linear(
+            self.hidden_dim, self.intermediate_size * 2, bias=False
+        )
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        # hidden_states: (, hidden_dim)
+        # 这里的hidden_states是被路由到当前专家的token组成的一个小批次
+        up, gate = self.up_gate_proj(hidden_states).chunk(2, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
+
+
+class MoE(nn.Module):
+    def __init__(self, config: MyModelConfig):
+        super().__init__()
+        self.config = config
+        self.n_routed_experts = config.n_routed_experts
+        self.top_k = config.n_experts_per_tok
+
+        self.router = MoeRouter(config)
+        self.experts = nn.ModuleList(
+            [MoeExpert(config) for _ in range(self.n_routed_experts)]
+        )
+        self.shared_experts = FFN(
+            config,
+            intermediate_size=config.intermediate_size // config.n_shared_experts,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states: (batch_size, seq_len, hidden_dim)
+        shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, shape[-1])  # (bsz*seq_len, hidden_dim)
+        weights, top_k_index = self.router(hidden_states)  # (bsz*seq_len, top_k)
+
+        # bitcount 一次计算
+        counts = torch.bincount(
+            top_k_index.flatten(), minlength=self.n_routed_experts
+        )  # (n_routed_experts,)
+        if self.training:
+            self.router._expert_load_accum += counts.float()
+
+        expert_outputs = torch.zeros_like(hidden_states)
+        counts_list = counts.cpu().tolist()
+        for i in range(self.n_routed_experts):
+            if counts_list[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(top_k_index == i)
+            expert_outputs[idx] += expert(hidden_states[idx]) * weights[idx, top, None]
+        shared_output = self.shared_experts(hidden_states)
+        return (expert_outputs + shared_output).view(shape)

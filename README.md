@@ -45,3 +45,31 @@ $$
 ### GQA
 对于MHA，每个token的query和key维度相同，切分head后也一致。GQA通过减少kv的维度，让若干head的q共享相同的kv，从而可以在不显著降低性能的同时减少计算量。由于在从x变换到kv时维度少了，因此实现了`repeat_kv`函数手动重复kv，在实际计算的时候仍然让每个head的q都能够与kv进行匹配。
 kv cache 在推理的decode阶段使用，通过传递`past_key_values`参数，可以避免重复计算。每次新生成一个token被加入序列后，Attention模块中需要更新kv cache，即将新产生的kv直接concat到`past_key_values`中。在hf transformers中，`past_key_values`被定义为`Cache`类，封装了update方法，并且所有层共用一个`Cache`对象，通过`layer_idx`进行区分。
+
+### FFN
+我们采用SwiGLU的实现，对中间线性变换后接一个门控机制，最开始的GLU使用sigmoid激活函数作为非线性激活函数产生门控信号，然后与线性变换结果逐元素相乘控制信息流动，在这里我们使用Swish激活函数代替sigmoid，并且参考主流实现没有添加偏置项。
+$$
+\text{SwiGLU}(\boldsymbol{x}) = ((\boldsymbol{x}\boldsymbol{W}_1) \odot \text{Swish}(\boldsymbol{x}\boldsymbol{W}_2) )\boldsymbol{W}_3
+$$
+使用GLU系列激活函数时，为了与经典FFN模块的参数量级一致，原本FFN会把输入维度升维至4倍，而GLU系列激活函数则只升维至$4\times2\div3=8/3$倍，因为GLU相比经典FFN多了一个线性变换权重。
+
+### MoE
+相比经典FFN，MoE可以看作显式稀疏的FFN，每次只有一部分专家被选中和激活，激活的专家本身还是一个小的FFN。
+
+本项目的实现中，我们采用了DeepSeek-V3提出的，基于无辅助损失函数的负载均衡策略。具体来说，在路由模块中，输入经过线性变换后，使用sigmoid激活函数而非softmax，随后会被加上一个偏置向量，其长度等于总的专家数量，用来调节每个专家的激活概率。在训练过程中，偏置会随batch被更新，每个batch中会统计各专家激活的token数，分别对高于/低于平均激活token数的专家的偏置进行增加/减少，每次更新的值为一个常量（预设的超参数，ds-V3论文中做了消融实验发现，这种常量更新策略比依赖具体距平差值更新或其它方案综合更好），从而实现负载均衡。
+考虑第$t$个token，其具体计算过程如下：
+$$
+\begin{aligned}
+\boldsymbol{out}_{t} &= \boldsymbol{h}_t + \sum_{i=1}^{\text{n\_experts}}g_{i,t}\text{FFN}_i(\boldsymbol{h}_t),\\
+g_{i,t} &=\begin{cases}s_{i,t},&s_{i,t}+b_{i}\in\mathrm{Topk}\left(\left\{s_{j,t}+b_{j}\mid1\leq j\leq N\right\},K\right),\\0,&\mathrm{otherwise},\end{cases}\\
+s_{i,t} &= \text{Sigmoid}(\boldsymbol{h}_t^\top\boldsymbol{W}),\\
+\end{aligned}
+$$
+需要注意的是，用来选择topk专家的是 $s_{i,t}+b_{i}$ ，而加权到FFN输出的是 $s_{i,t}$ ，这是DeepSeek-V3等模型与其它有辅助损失函数的MoE模型的主要区别。
+除了无损负载均衡策略，本项目还实现了共享专家，即在路由专家以外还有一个FFN模块，所有token都会经过这个FFN模块。
+
+DeepSeek-V3中还采用了分组路由，把所有路由专家分成若干组，对于每个 token，先确保选择的专家仅在 topk_group 组内，再选择这些组内的 num_experts_per_tok 个专家。但是在本项目实现中，我们并没有采用这种机制。
+
+除此之外，在DeepSeek-V3和GLM-4.5等类似架构的MoE模型中，还额外设置了一个`route_scale`参数，用在加权分数weight已经归一化之后。该参数在GLM-4.5中被设为1，而在DeepSeek-V3中被设为2.5，其具体作用在DeepSeek-V3论文中并没有详细解释，有推测这可能是为了放大路由权重的幅值，从而调整梯度传播强度与专家选择的置信度（参考：[DeepSeek V3/R1 MoeGate的routed scaling factor是怎么得出的？ - 芝士AI吃鱼的回答](https://www.zhihu.com/question/12919742971/answer/106906875143)）。但在本项目中，该参数和有关代码都去掉了。
+
+在具体实现有关模块时，本人参考了DeepSeek-V3和GLM-4.5等模型的实现代码，但并没有发现对路由模块中偏置项`e_score_correction_bias`的具体更新操作，也没有暴露合适的接口与变量来让外部脚本能够“每个batch中统计各专家激活的token数”，因此本项目中的`MoeRouter`模块额外实现了`_expert_load_accum`变量与`update_bias`方法，主要在训练时使用。
