@@ -1,6 +1,7 @@
-from typing import Optional, Tuple
-from transformers import PretrainedConfig
+from typing import Optional, Tuple, List, Union
+from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class MyModelConfig(PretrainedConfig):
@@ -27,6 +28,7 @@ class MyModelConfig(PretrainedConfig):
         ############ MoE ############
         use_moe: bool = True,
         num_experts_per_tok: int = 2,  # 每个token路由到的专家数量
+        first_k_dense_replace: int = 1,  # 从第几层开始用MoE替换FFN
         n_routed_experts: int = 8,  # 总的路由专家数量
         n_shared_experts: int = 1,  # 共享专家数量
         moe_intermediate_size: Optional[int] = None,  # MoE层的intermediate_size，如果为None则在类中计算
@@ -53,6 +55,7 @@ class MyModelConfig(PretrainedConfig):
         self.flash_attention = flash_attention
         self.use_moe = use_moe
         self.num_experts_per_tok = num_experts_per_tok
+        self.first_k_dense_replace = first_k_dense_replace
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.moe_intermediate_size = moe_intermediate_size
@@ -89,33 +92,55 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
-def precompute_freqs(hidden_dim: int, seq_len: int, theta: int = 1000000):
+def precompute_freqs(
+    head_dim: int,
+    seq_len: int,
+    theta: int = 1000000,
+    partial_rotary_factor: float = 1.0,
+):
     # 1. freq = 1/(theta^(i/dim)) for i = 0, 2, 4, ..., dim-2
-    freqs = 1.0 / (theta ** (torch.arange(0, hidden_dim, 2).float() / hidden_dim))
+    dim = int(head_dim * partial_rotary_factor)
+    dim = dim // 2 * 2  # 确保dim是偶数
+
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     # TODO: 实现YaRN
-    # 2. 将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
+    # 2. 将位置 t 与 freqs 相乘，freqs_i = theta^(-2i/dim)
     t = torch.arange(seq_len, device=freqs.device).float()
     freqs = torch.outer(t, freqs).float()  # (seq_len, dim//2)
 
-    # 3. 计算余弦和正弦值
-    freqs_cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1)  # (seq_len, dim)
-    freqs_sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1)  # (seq_len, dim)
+    # 3. 填充余弦和正弦值到 (seq_len, hidden_dim) 的矩阵中
+    half = head_dim // 2
+    freqs_cos = torch.ones(1, seq_len, head_dim)
+    p_cos = freqs.cos()
+    freqs_cos[:, :, : dim // 2] = p_cos
+    freqs_cos[:, half : half + dim // 2] = p_cos
+
+    freqs_sin = torch.zeros(1, seq_len, head_dim)
+    p_sin = freqs.sin()
+    freqs_sin[:, :, : dim // 2] = p_sin
+    freqs_sin[:, half : half + dim // 2] = p_sin
 
     return freqs_cos, freqs_sin
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    q, k: [batch, num_heads, seq_len, head_dim]
+    cos, sin: [1, seq_len, head_dim]
+    position_ids: [batch, seq_len] 可选
+    unsqueeze_dim: 扩展维度位置（1 或 2），默认为1意味着将在num_heads维度上扩展以匹配q/k的形状，对应的q/k形状为[batch, num_heads, seq_len, head_dim]，即在q/k应用transpose(1, 2)之后该函数被调用
+    """
+    # 1. 扩展维度以匹配 q/k 的广播
+    cos = cos.unsqueeze(unsqueeze_dim)  # [1, 1, seq_len, head_dim]
+    sin = sin.unsqueeze(unsqueeze_dim)
+
     def rotate_half(x):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
-    )
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
-    )
+    q_embed = q * cos + rotate_half(q) * sin
+    k_embed = k * cos + rotate_half(k) * sin
     return q_embed, k_embed
 
 
@@ -174,37 +199,39 @@ class Attention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # hidden_states: (batch_size, seq_len, hidden_dim)
-        # position_embeddings: (cos, sin) each of shape (seq_len, hidden_dim)
+        # position_embeddings: (cos, sin) each of shape (seq_len, head_dim)
         # attention_mask: (batch_size, 1, 1, seq_len) or None
         # past_key_values: ((batch_size, num_attention_heads, past_seq_len, head_dim), (batch_size, num_attention_heads, past_seq_len, head_dim)) or None
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape = (bsz, seq_len, -1, self.head_dim)
 
+        # 1. 线性变换得到 q, k, v
         query = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
         key = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
         value = self.v_proj(hidden_states).view(hidden_shape)
 
-        cos, sin = position_embeddings  # (seq_len, hidden_dim)
+        query = query.transpose(1, 2)  # (bsz, num_heads, seq_len, head_dim)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        # 2. 应用旋转位置编码
+        cos, sin = position_embeddings  # (seq_len, head_dim)
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        query = query.transpose(1, 2)  # (bsz, num_heads, seq_len, head_dim)
-        key = repeat_kv(key, self.n_rep).transpose(
-            1, 2
-        )  # (bsz, num_heads, seq_len, head_dim)
-        value = repeat_kv(value, self.n_rep).transpose(
-            1, 2
-        )  # (bsz, num_heads, seq_len, head_dim)
-
+        # 3. 更新 KV Cache
         if past_key_values is not None:
             # 将当前的key和value与过去的key和value拼接起来
             past_key, past_value = past_key_values
-            key = torch.cat(
-                [past_key, key], dim=2
-            )  # (bsz, num_key_value_heads, past_seq_len + seq_len, head_dim)
-            value = torch.cat(
-                [past_value, value], dim=2
-            )  # (bsz, num_key_value_heads, past_seq_len + seq_len, head_dim)
-            past_key_values = (key, value)
+            # (bsz, num_kv_heads, past_seq_len + seq_len, head_dim)
+            key = torch.cat([past_key, key], dim=2)
+            value = torch.cat([past_value, value], dim=2)
+        past_key_values = (key, value) if use_cache else None
+
+        # 4. 扩展key和value以匹配query的num_attention_heads
+        key = repeat_kv(
+            key, self.n_rep
+        )  # (bsz, seq_len, num_attention_heads, head_dim)
+        value = repeat_kv(value, self.n_rep)
 
         if (
             self.flash
@@ -213,8 +240,8 @@ class Attention(nn.Module):
             and (attention_mask is None or torch.all(attention_mask == 1))
         ):
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query, key, value, attn_mask=None, dropout_p=0.0, is_causal=True
-            )  # (bsz, num_attention_heads, seq_len, head_dim)
+                query, key, value, attn_mask=None, is_causal=True
+            )
         else:
             attn_scores = query @ key.transpose(-1, -2) / (self.head_dim**0.5)
             attn_scores[:, :, :, -seq_len:] += torch.triu(
@@ -284,7 +311,9 @@ class MoeRouter(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # hidden_states: (batch_size, seq_len, hidden_dim)
         bsz, seq_len, _ = hidden_states.shape
-        hidden_states = hidden_states.view(bsz * seq_len, -1)  # (bsz*seq_len, hidden_dim)
+        hidden_states = hidden_states.view(
+            bsz * seq_len, -1
+        )  # (bsz*seq_len, hidden_dim)
 
         # 计算路由分数
         scores = nn.functional.linear(
@@ -387,3 +416,164 @@ class MoE(nn.Module):
             expert_outputs[idx] += expert(hidden_states[idx]) * weights[idx, top, None]
         shared_output = self.shared_experts(hidden_states)
         return (expert_outputs + shared_output).view(shape)
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, config: MyModelConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.hidden_dim = config.hidden_dim
+        self.layer_idx = layer_idx
+
+        self.attention = Attention(config)
+
+        if layer_idx >= config.first_k_dense_replace and config.use_moe:
+            self.ffn = MoE(config)
+        else:
+            self.ffn = FFN(config)
+
+        self.input_layernorm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_output, present_key_values = self.attention(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values,
+            use_cache,
+        )
+
+        hidden_states = residual + attn_output
+
+        hidden_states = hidden_states + self.ffn(
+            self.post_attention_layernorm(hidden_states)
+        )
+
+        return hidden_states, present_key_values
+
+
+class MyModel(nn.Module):
+    def __init__(self, config: MyModelConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.final_layernorm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs(
+            config.hidden_dim // config.num_attention_heads,
+            config.max_position_embeddings,
+            config.rope_theta,
+            partial_rotary_factor=config.partial_rotary_factor,
+        )
+        self.register_buffer("freqs_cos", freqs_cos)
+        self.register_buffer("freqs_sin", freqs_sin)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
+        # input_ids: (batch_size, seq_len)
+        # past_key_values: 若干层的tuple组成的list，每层是tuple[key, value]
+        bsz, seq_len = input_ids.shape
+
+        # 兼容hf transformers
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+        past_key_values = past_key_values or [None] * self.num_hidden_layers
+
+        # 取某一层的past_key_values来计算当前输入的起始位置
+        start_pos = (
+            past_key_values[0][0].shape[2] if past_key_values[0] is not None else 0
+        )
+
+        # 根据起始位置生成位置编码索引，并从预计算的频率中取出对应的cos和sin值
+        position_ids = torch.arange(
+            start_pos, start_pos + seq_len, device=input_ids.device
+        )
+        position_ids = position_ids.unsqueeze(0)
+        position_embeddings = (
+            self.freqs_cos[position_ids],
+            self.freqs_sin[position_ids],
+        )  # (1, seq_len, head_dim) batch维度自动广播
+
+        hidden_states = self.embed_tokens(input_ids)  # (bsz, seq_len, hidden_dim)
+        all_present_key_values = []
+
+        for layer_idx, (layer, pkv) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present_key_values = layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                pkv,
+                use_cache,
+            )
+            all_present_key_values.append(present_key_values)
+
+        hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states, all_present_key_values if use_cache else None
+
+
+class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MyModelConfig
+
+    def __init__(self, config: MyModelConfig):
+        super().__init__(config)
+        self.model = MyModel(config)
+        self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ) -> CausalLMOutputWithPast:
+        hidden_states, present_key_values = self.model(
+            input_ids, attention_mask, past_key_values, use_cache, **args
+        )
+        # 只计算最后输入的token的logits以节省计算
+        # 使用内置slice方法
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(
+            hidden_states[:, slice_indices, :]
+        )  # (bsz, logits_to_keep, vocab_size)
+
+        loss = None
+        if labels is not None:
+            # 继承PreTrainedModel默认self.loss_function为CrossEntropyLoss
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **args
+            )
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=present_key_values,
+            hidden_states=hidden_states,
+        )
