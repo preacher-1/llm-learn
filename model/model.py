@@ -51,6 +51,7 @@ class MyModelConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
+        self.partial_rotary_factor = partial_rotary_factor
         self.inference_rope_scaling = inference_rope_scaling
         self.flash_attention = flash_attention
         self.use_moe = use_moe
