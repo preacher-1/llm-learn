@@ -31,6 +31,7 @@ class MyModelConfig(PretrainedConfig):
         first_k_dense_replace: int = 1,  # 从第几层开始用MoE替换FFN
         n_routed_experts: int = 8,  # 总的路由专家数量
         n_shared_experts: int = 1,  # 共享专家数量
+        routed_scaling_factor: float = 1.4,
         moe_intermediate_size: Optional[int] = None,  # MoE层的intermediate_size，如果为None则在类中计算
         bias_update_speed: float = 0.001,  # 路由分数偏置的更新速度
         norm_topk_prob: bool = True,
@@ -59,6 +60,7 @@ class MyModelConfig(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
+        self.routed_scaling_factor = routed_scaling_factor
         self.moe_intermediate_size = moe_intermediate_size
         self.bias_update_speed = bias_update_speed
         self.norm_topk_prob = norm_topk_prob
@@ -291,6 +293,7 @@ class MoeRouter(nn.Module):
         self.config = config
         self.top_k = config.n_routed_experts
         self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
         self.n_group = config.n_group
         self.norm_topk_prob = config.norm_topk_prob
 
@@ -329,7 +332,7 @@ class MoeRouter(nn.Module):
         if self.norm_topk_prob:
             weights_sum = weights.sum(dim=-1, keepdim=True)
             weights = weights / (weights_sum + 1e-10)
-        # weights = weights * self.route_scale
+        weights = weights * self.routed_scaling_factor
         return weights.type_as(hidden_states), top_k_index
 
     def update_bias(self):

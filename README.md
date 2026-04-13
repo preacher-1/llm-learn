@@ -70,6 +70,37 @@ $$
 
 DeepSeek-V3中还采用了分组路由，把所有路由专家分成若干组，对于每个 token，先确保选择的专家仅在 topk_group 组内，再选择这些组内的 num_experts_per_tok 个专家。但是在本项目实现中，我们并没有采用这种机制。
 
-除此之外，在DeepSeek-V3和GLM-4.5等类似架构的MoE模型中，还额外设置了一个`route_scale`参数，用在加权分数weight已经归一化之后。该参数在GLM-4.5中被设为1，而在DeepSeek-V3中被设为2.5，其具体作用在DeepSeek-V3论文中并没有详细解释，有推测这可能是为了放大路由权重的幅值，从而调整梯度传播强度与专家选择的置信度（参考：[DeepSeek V3/R1 MoeGate的routed scaling factor是怎么得出的？ - 芝士AI吃鱼的回答](https://www.zhihu.com/question/12919742971/answer/106906875143)）。但在本项目中，该参数和有关代码都去掉了。
+除此之外，在DeepSeek-V3和GLM-4.5等类似架构的MoE模型中，还额外设置了一个`route_scale`参数，用在加权分数weight已经归一化之后。该参数在GLM-4.5中被设为1，而在DeepSeek-V3中被设为2.5，其具体作用在DeepSeek-V3论文中并没有详细解释。这里引用苏剑林老师在博客中对于该参数的解释（[《MoE环游记：5、均匀分布的反思 》](https://kexue.fm/archives/10945)）：
+> 我们将式(2)一般地写成
+> $$\boldsymbol{y} = \sum_{i=1}^s \boldsymbol{e}_i + \lambda\sum_{i\in \mathop{\text{argtop}}_{k-s} \boldsymbol{\rho}_{[s:]}} \rho_{i+s} \boldsymbol{e}_{i+s}$$
+> 由于Routed Expert带有权重$\rho_{i+s}$而Shared Expert没有，以及Routed Expert的数目通常远大于Shared Expert数目（即$n−s\gg s$）等原因，它们的比例可能会失衡，因此为了让两者不至于被相互埋没，设置合理的$\lambda$尤为重要。对此，我们在[《Muon is Scalable for LLM Training》](https://papers.cool/arxiv/2502.16982)提出，适当的$\lambda$应使得两者在初始化阶段模长接近一致。
+> 
+> 具体来说，我们假设每个Expert在初始化阶段具有相同的模长（不失一般性，可以直接设为1），并且满足两两正交，然后假设Router的logits服从标准正态分布（即零均值、单位方差，当然如果觉得有必要，也可以考虑其他方差）。这样一来，$s$个Shared Expert的总模长就是$\sqrt{s}$，而Routed Expert的总模长是
+> $$\lambda\sqrt{\sum_{i\in \mathop{\text{argtop}}_{k-s} \boldsymbol{\rho}_{[s:]}} \rho_{i+s}^2}$$
+> 通过让它等于$\sqrt{s}$，我们就可以估计出$\lambda$。由于激活函数、是否重归一化等选择，不同MoE的Router差别可能比较大，所以我们也不设法求解析解，而是直接数值模拟：
+> ```python
+> import numpy as np
+> 
+> def sigmoid(x):
+>     return 1 / (1 + np.exp(-x))
+>
+> def softmax(x):
+>     return (p := np.exp(x)) / p.sum()
+>
+> def scaling_factor(n, k, s, act='softmax', renorm=False):
+>     factors = []
+>     for _ in range(10000):
+>        logits = np.random.randn(n - s)
+>         p = np.sort(eval(act)(logits))[::-1][:k - s]
+>         if renorm:
+>             p /= p.sum()
+>         factors.append(s**0.5 / (p**2).sum()**0.5)
+>     return np.mean(factors)
+>
+> scaling_factor(162, 8, 2, 'softmax', False)
+> scaling_factor(257, 9, 1, 'sigmoid', True)
+> ```
+> 非常巧的是，这个脚本的模拟结果跟DeepSeek-V2、DeepSeek-V3的设置都很吻合。其中，DeepSeek-V2有$n=162,k=8,s=2$，Softmax激活并且没有重归一化，上述脚本的模拟结果约等于16，而DeepSeek-V2的$\lambda$正好是16；DeepSeek-V3则有$n=257,k=9,s=1$，Sigmoid激活且重归一化，脚本的结果大约是2.83，而DeepSeek-V3的$\lambda$则是2.5。
+
 
 在具体实现有关模块时，本人参考了DeepSeek-V3和GLM-4.5等模型的实现代码，但并没有发现对路由模块中偏置项`e_score_correction_bias`的具体更新操作，也没有暴露合适的接口与变量来让外部脚本能够“每个batch中统计各专家激活的token数”，因此本项目中的`MoeRouter`模块额外实现了`_expert_load_accum`变量与`update_bias`方法，主要在训练时使用。
