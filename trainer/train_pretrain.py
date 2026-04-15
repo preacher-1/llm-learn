@@ -90,7 +90,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = "_moe" if model_config.use_moe else ""
-            ckpt = f"{args.save_dir}/{args.save_weight}_{model_config.hidden_dim}{moe_suffix}_epoch{epoch + 1}_step{step}.pt"
+            ckpt = f"{args.save_dir}/{args.save_weight}_{model_config.hidden_size}{moe_suffix}_epoch{epoch + 1}_step{step}.pt"
             raw_model = (
                 model.module if isinstance(model, DistributedDataParallel) else model
             )
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
 
     model_config = MyModelConfig(
-        hidden_dim=args.hidden_size,
+        hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
         max_seq_len=args.max_seq_len,
         use_moe=bool(args.use_moe),

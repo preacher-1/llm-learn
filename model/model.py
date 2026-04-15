@@ -13,7 +13,7 @@ class MyModelConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        hidden_dim: int = 512,
+        hidden_size: int = 512,
         intermediate_size: int = 1365,  # 512*8/3
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
@@ -43,7 +43,7 @@ class MyModelConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.hidden_act = hidden_act
-        self.hidden_dim = hidden_dim
+        self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_position_embeddings = max_position_embeddings
         self.num_attention_heads = num_attention_heads
@@ -84,9 +84,9 @@ import torch.nn as nn
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_dim: int, eps: float = 1e-05):
+    def __init__(self, hidden_size: int, eps: float = 1e-05):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_dim))  # gamma
+        self.weight = nn.Parameter(torch.ones(hidden_size))  # gamma
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -111,7 +111,7 @@ def precompute_freqs(
     t = torch.arange(seq_len, device=freqs.device).float()
     freqs = torch.outer(t, freqs).float()  # (seq_len, dim//2)
 
-    # 3. 填充余弦和正弦值到 (seq_len, hidden_dim) 的矩阵中
+    # 3. 填充余弦和正弦值到 (seq_len, hidden_size) 的矩阵中
     half = head_dim // 2
     freqs_cos = torch.ones(1, seq_len, head_dim, device=freqs.device)
     p_cos = freqs.cos()
@@ -164,22 +164,22 @@ class Attention(nn.Module):
         self.config = config
 
         assert (
-            config.hidden_dim % config.num_attention_heads == 0
-        ), "hidden_dim must be divisible by num_attention_heads"
-        self.head_dim = config.hidden_dim // config.num_attention_heads
+            config.hidden_size % config.num_attention_heads == 0
+        ), "hidden_size must be divisible by num_attention_heads"
+        self.head_dim = config.hidden_size // config.num_attention_heads
         self.n_rep = config.num_attention_heads // config.num_key_value_heads
 
         self.q_proj = nn.Linear(
-            config.hidden_dim, config.num_attention_heads * self.head_dim, bias=False
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            config.hidden_dim, config.num_key_value_heads * self.head_dim, bias=False
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            config.hidden_dim, config.num_key_value_heads * self.head_dim, bias=False
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_dim, bias=False
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
         )
 
         # 参考Qwen3使用QKNorm
@@ -201,7 +201,7 @@ class Attention(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # hidden_states: (batch_size, seq_len, hidden_dim)
+        # hidden_states: (batch_size, seq_len, hidden_size)
         # position_embeddings: (cos, sin) each of shape (seq_len, head_dim)
         # attention_mask: (batch_size, 1, 1, seq_len) or None
         # past_key_values: ((batch_size, num_attention_heads, past_seq_len, head_dim), (batch_size, num_attention_heads, past_seq_len, head_dim)) or None
@@ -282,7 +282,7 @@ class Attention(nn.Module):
             attn_output = attn_scores @ value  # (bsz, num_heads, seq_len, head_dim)
             
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        attn_output = self.o_proj(attn_output)  # (bsz, seq_len, hidden_dim)
+        attn_output = self.o_proj(attn_output)  # (bsz, seq_len, hidden_size)
 
         return attn_output, past_key_values
 
@@ -291,20 +291,20 @@ class FFN(nn.Module):
     def __init__(self, config: MyModelConfig, intermediate_size: Optional[int] = None):
         super().__init__()
         self.config = config
-        self.hidden_dim = config.hidden_dim
+        self.hidden_size = config.hidden_size
         self.intermediate_size = (
             config.intermediate_size if intermediate_size is None else intermediate_size
         )
 
         self.up_gate_proj = nn.Linear(
-            self.hidden_dim, self.intermediate_size * 2, bias=False
+            self.hidden_size, self.intermediate_size * 2, bias=False
         )
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states: (batch_size, seq_len, hidden_dim)
+        # hidden_states: (batch_size, seq_len, hidden_size)
         up, gate = self.up_gate_proj(hidden_states).chunk(2, dim=-1)
         return self.down_proj(self.act_fn(gate) * up)
 
@@ -320,8 +320,8 @@ class MoeRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
 
         self.weight = nn.Parameter(
-            torch.randn(self.n_routed_experts, config.hidden_dim)
-        )  # (n_routed_experts, hidden_dim)
+            torch.randn(self.n_routed_experts, config.hidden_size)
+        )  # (n_routed_experts, hidden_size)
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(self.n_routed_experts, dtype=torch.float32),
         )
@@ -335,11 +335,11 @@ class MoeRouter(nn.Module):
         self.bias_update_speed = config.bias_update_speed
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # hidden_states: (batch_size, seq_len, hidden_dim)
+        # hidden_states: (batch_size, seq_len, hidden_size)
         bsz, seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.view(
             bsz * seq_len, -1
-        )  # (bsz*seq_len, hidden_dim)
+        )  # (bsz*seq_len, hidden_size)
 
         # 计算路由分数
         scores = nn.functional.linear(
@@ -381,23 +381,23 @@ class MoeExpert(nn.Module):
         super().__init__()
         self.config = config
         self.n_routed_experts = config.n_routed_experts
-        self.hidden_dim = config.hidden_dim
+        self.hidden_size = config.hidden_size
         if config.moe_intermediate_size is not None:
             self.intermediate_size = config.moe_intermediate_size
         else:
             self.intermediate_size = config.intermediate_size // config.n_routed_experts
 
         self.up_gate_proj = nn.Linear(
-            self.hidden_dim, self.intermediate_size * 2, bias=False
+            self.hidden_size, self.intermediate_size * 2, bias=False
         )
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_dim, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # hidden_states: (, hidden_dim)
+        # hidden_states: (, hidden_size)
         # 这里的hidden_states是被路由到当前专家的token组成的一个小批次
         up, gate = self.up_gate_proj(hidden_states).chunk(2, dim=-1)
         return self.down_proj(self.act_fn(gate) * up)
@@ -420,9 +420,9 @@ class MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states: (batch_size, seq_len, hidden_dim)
+        # hidden_states: (batch_size, seq_len, hidden_size)
         shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, shape[-1])  # (bsz*seq_len, hidden_dim)
+        hidden_states = hidden_states.view(-1, shape[-1])  # (bsz*seq_len, hidden_size)
         weights, top_k_index = self.router(hidden_states)  # (bsz*seq_len, top_k)
 
         # bitcount 一次计算
@@ -448,7 +448,7 @@ class DecoderLayer(nn.Module):
     def __init__(self, config: MyModelConfig, layer_idx: int):
         super().__init__()
         self.config = config
-        self.hidden_dim = config.hidden_dim
+        self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
         self.attention = Attention(config)
@@ -458,8 +458,8 @@ class DecoderLayer(nn.Module):
         else:
             self.ffn = FFN(config)
 
-        self.input_layernorm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -495,14 +495,14 @@ class MyModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.final_layernorm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
+        self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         freqs_cos, freqs_sin = precompute_freqs(
-            config.hidden_dim // config.num_attention_heads,
+            config.hidden_size // config.num_attention_heads,
             config.max_position_embeddings,
             config.rope_theta,
             partial_rotary_factor=config.partial_rotary_factor,
@@ -546,7 +546,7 @@ class MyModel(nn.Module):
             self.freqs_sin[:, start_pos : start_pos + seq_len],
         )
 
-        hidden_states = self.embed_tokens(input_ids)  # (bsz, seq_len, hidden_dim)
+        hidden_states = self.embed_tokens(input_ids)  # (bsz, seq_len, hidden_size)
         all_present_key_values = []
 
         for layer_idx, (layer, pkv) in enumerate(zip(self.layers, past_key_values)):
@@ -570,7 +570,7 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
     def __init__(self, config: MyModelConfig):
         super().__init__(config)
         self.model = MyModel(config)
-        self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
         self,
