@@ -148,14 +148,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    # x: (batch_size, seq_len, num_heads, head_dim)
-    bsz, seq_len, num_heads, head_dim = x.shape
+    # x: (batch_size, num_kv_heads, seq_len, head_dim)
+    bsz, num_kv_heads, seq_len, head_dim = x.shape
     # 使用expand和reshape来重复每个头n_rep次，此处n_rep是在外部计算好的
     if n_rep == 1:
         return x
-    x = x.unsqueeze(2)  # (bsz, seq_len, 1, num_heads, head_dim)
-    x = x.expand(bsz, seq_len, n_rep, num_heads, head_dim)
-    return x.reshape(bsz, seq_len, n_rep * num_heads, head_dim)
+    x = x.unsqueeze(2)  # (bsz, num_kv_heads, 1, seq_len, head_dim)
+    x = x.expand(bsz, num_kv_heads, n_rep, seq_len, head_dim)
+    return x.reshape(bsz, num_kv_heads * n_rep, seq_len, head_dim)
 
 
 class Attention(nn.Module):
@@ -183,8 +183,8 @@ class Attention(nn.Module):
         )
 
         # 参考Qwen3使用QKNorm
-        self.q_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(config.num_attention_heads * self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(config.num_key_value_heads * self.head_dim, eps=config.rms_norm_eps)
 
         # 是否使用flash attention
         self.flash = (
@@ -209,8 +209,8 @@ class Attention(nn.Module):
         hidden_shape = (bsz, seq_len, -1, self.head_dim)
 
         # 1. 线性变换得到 q, k, v
-        query = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
-        key = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        query = self.q_norm(self.q_proj(hidden_states)).view(hidden_shape)
+        key = self.k_norm(self.k_proj(hidden_states)).view(hidden_shape)
         value = self.v_proj(hidden_states).view(hidden_shape)
 
         query = query.transpose(1, 2)  # (bsz, num_heads, seq_len, head_dim)
@@ -236,29 +236,51 @@ class Attention(nn.Module):
         )  # (bsz, seq_len, num_attention_heads, head_dim)
         value = repeat_kv(value, self.n_rep)
 
-        if (
-            self.flash
-            and (seq_len > 1)
-            and (past_key_values is None)
-            and (attention_mask is None or torch.all(attention_mask == 1))
-        ):
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query, key, value, attn_mask=None, is_causal=True
-            )
+        if self.flash and (seq_len > 1) and (past_key_values is None):
+            if attention_mask is None or torch.all(attention_mask == 1):
+                # 直接使用原生 Causal 加速 (此时性能最高，可触发纯正 FlashAttention)
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query, key, value, attn_mask=None, is_causal=True
+                )
+            else:                
+                # 扩充 Padding Mask 为 bool 类型: [bsz, 1, 1, seq_len]
+                if attention_mask.dim() == 2:
+                    pad_mask = attention_mask.unsqueeze(1).unsqueeze(2).bool() 
+                else:
+                    pad_mask = attention_mask.bool()
+                
+                # 构造 Causal Mask (下三角为 True): [1, 1, seq_len, seq_len]
+                causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=query.device))
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+                
+                # 合并 Mask (利用广播机制，结果为 [bsz, 1, seq_len, seq_len])
+                # 只有既是有效 token (pad_mask) 又是当前位置之前的 token (causal_mask) 才为 True
+                final_mask = pad_mask & causal_mask
+                
+                # 传给 SDPA (此时必须设置 is_causal=False，因为 causal 逻辑已经在 final_mask 里了)
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query, key, value, attn_mask=final_mask, is_causal=False
+                )
         else:
             attn_scores = query @ key.transpose(-1, -2) / (self.head_dim**0.5)
+            
+            # Causal mask 处理
             attn_scores[:, :, :, -seq_len:] += torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=query.device),
                 diagonal=1,
-            )  # causal mask
+            ) 
+            
+            # Padding mask 处理
             if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 attn_scores = attn_scores.masked_fill(
                     attention_mask == 0, float("-inf")
                 )
-            attn_scores = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(
-                query.dtype
-            )
+                
+            attn_scores = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
             attn_output = attn_scores @ value  # (bsz, num_heads, seq_len, head_dim)
+            
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         attn_output = self.o_proj(attn_output)  # (bsz, seq_len, hidden_dim)
 
@@ -509,15 +531,20 @@ class MyModel(nn.Module):
             past_key_values[0][0].shape[2] if past_key_values[0] is not None else 0
         )
 
-        # 根据起始位置生成位置编码索引，并从预计算的频率中取出对应的cos和sin值
-        position_ids = torch.arange(
-            start_pos, start_pos + seq_len, device=input_ids.device
-        )
-        position_ids = position_ids.unsqueeze(0)
+        # # 根据起始位置生成位置编码索引，并从预计算的频率中取出对应的cos和sin值
+        # position_ids = torch.arange(
+        #     start_pos, start_pos + seq_len, device=input_ids.device
+        # )
+        # position_ids = position_ids.unsqueeze(0)
+        # position_embeddings = (
+        #     self.freqs_cos[position_ids],
+        #     self.freqs_sin[position_ids],
+        # )  # (1, seq_len, head_dim) batch维度自动广播
+        # 直接在预计算矩阵的 sequence 维度 (dim=1) 上进行切片截取
         position_embeddings = (
-            self.freqs_cos[position_ids],
-            self.freqs_sin[position_ids],
-        )  # (1, seq_len, head_dim) batch维度自动广播
+            self.freqs_cos[:, start_pos : start_pos + seq_len],
+            self.freqs_sin[:, start_pos : start_pos + seq_len],
+        )
 
         hidden_states = self.embed_tokens(input_ids)  # (bsz, seq_len, hidden_dim)
         all_present_key_values = []
