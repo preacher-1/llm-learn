@@ -29,7 +29,7 @@ class PretrainDataset(Dataset):
             max_length=self.max_length - 2,  # 留出特殊标记的位置
             truncation=True,
         ).input_ids
-        tokens = [self.tokenizer.cls_token_id] + tokens + [self.tokenizer.sep_token_id]
+        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
         input_ids = tokens + [self.tokenizer.pad_token_id] * (
             self.max_length - len(tokens)
         )
