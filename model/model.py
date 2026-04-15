@@ -113,15 +113,15 @@ def precompute_freqs(
 
     # 3. 填充余弦和正弦值到 (seq_len, hidden_dim) 的矩阵中
     half = head_dim // 2
-    freqs_cos = torch.ones(1, seq_len, head_dim)
+    freqs_cos = torch.ones(1, seq_len, head_dim, device=freqs.device)
     p_cos = freqs.cos()
     freqs_cos[:, :, : dim // 2] = p_cos
-    freqs_cos[:, half : half + dim // 2] = p_cos
+    freqs_cos[:, :, half : half + dim // 2] = p_cos
 
-    freqs_sin = torch.zeros(1, seq_len, head_dim)
+    freqs_sin = torch.zeros(1, seq_len, head_dim, device=freqs.device)
     p_sin = freqs.sin()
     freqs_sin[:, :, : dim // 2] = p_sin
-    freqs_sin[:, half : half + dim // 2] = p_sin
+    freqs_sin[:, :, half : half + dim // 2] = p_sin
 
     return freqs_cos, freqs_sin
 
@@ -270,7 +270,7 @@ class FFN(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_dim = config.hidden_dim
-        intermediate_size = (
+        self.intermediate_size = (
             config.intermediate_size if intermediate_size is None else intermediate_size
         )
 
