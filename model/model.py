@@ -316,7 +316,6 @@ class MoeRouter(nn.Module):
         self.top_k = config.n_routed_experts
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
         self.norm_topk_prob = config.norm_topk_prob
 
         self.weight = nn.Parameter(
@@ -408,7 +407,7 @@ class MoE(nn.Module):
         super().__init__()
         self.config = config
         self.n_routed_experts = config.n_routed_experts
-        self.top_k = config.n_experts_per_tok
+        self.top_k = config.num_experts_per_tok
 
         self.router = MoeRouter(config)
         self.experts = nn.ModuleList(
