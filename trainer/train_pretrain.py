@@ -1,4 +1,5 @@
 import os
+import glob
 import sys
 
 
@@ -35,6 +36,7 @@ warnings.filterwarnings("ignore")
 def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
+    global best_loss
 
     for step, data in enumerate(dataloader, start=start_step + 1):
         input_ids = data["input_ids"].to(args.device)
@@ -127,6 +129,31 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
             model.train()
             del state_dict
 
+            # 保存 Best 模型
+            current_save_loss = loss.item() * args.gradient_accumulation_steps
+            if current_save_loss < best_loss:
+                best_loss = current_save_loss
+                import shutil
+                best_ckpt = f"{args.save_dir}/{args.save_weight}_{model_config.hidden_size}{moe_suffix}_best.pt"
+                # 直接在文件系统层面复制，速度极快且不用重新生成 state_dict
+                shutil.copyfile(ckpt, best_ckpt)
+                Logger(f"🌟 New best model found (loss: {best_loss:.4f}), saved to {best_ckpt}")
+
+            # 删除旧的 checkpoint
+            if args.save_total_limit > 0:
+                import glob
+                # 匹配当前保存目录下所有符合当前实验前缀和维度的权重文件
+                pattern = f"{args.save_dir}/{args.save_weight}_{model_config.hidden_size}{moe_suffix}_epoch*_step*.pt"
+                # 按文件最后修改时间升序排列（旧文件在前）
+                all_ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+                
+                # 保留最新的 save_total_limit 个，删除其余旧文件
+                for old_ckpt in all_ckpts[:-args.save_total_limit]:
+                    try:
+                        os.remove(old_ckpt)
+                    except OSError:
+                        pass
+
         del input_ids, labels, attention_mask, outputs, loss
 
         if last_step > start_step and last_step % args.gradient_accumulation_steps != 0:
@@ -161,6 +188,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+    parser.add_argument("--save_total_limit", type=int, default=3, help="最多保存的 checkpoint 数量（<=0 表示不限制）")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=512, type=int, help="训练的最大截断长度")
@@ -248,6 +276,8 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
+
+    best_loss = float('inf')
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler:
