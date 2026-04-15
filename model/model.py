@@ -313,7 +313,7 @@ class MoeRouter(nn.Module):
     def __init__(self, config: MyModelConfig):
         super().__init__()
         self.config = config
-        self.top_k = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok
         self.n_routed_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
@@ -321,7 +321,8 @@ class MoeRouter(nn.Module):
         self.weight = nn.Parameter(
             torch.randn(self.n_routed_experts, config.hidden_size)
         )  # (n_routed_experts, hidden_size)
-        self.e_score_correction_bias = nn.Parameter(
+        self.register_buffer(
+            "e_score_correction_bias",
             torch.zeros(self.n_routed_experts, dtype=torch.float32),
         )
         # 累积当前 step 内各专家被选中的 token 数
@@ -409,10 +410,17 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList(
             [MoeExpert(config) for _ in range(self.n_routed_experts)]
         )
-        self.shared_experts = FFN(
-            config,
-            intermediate_size=config.intermediate_size // config.n_shared_experts,
-        )
+        if config.moe_intermediate_size:
+            self.shared_experts = FFN(
+                config,
+                intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            )
+        else:
+            expert_mid_size = config.intermediate_size // config.n_routed_experts
+            self.shared_experts = FFN(
+                config,
+                intermediate_size=expert_mid_size * config.n_shared_experts,
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: (batch_size, seq_len, hidden_size)
@@ -428,7 +436,7 @@ class MoE(nn.Module):
             self.router._expert_load_accum += counts.float()
 
         expert_outputs = torch.zeros_like(hidden_states)
-        counts_list = counts.cpu().tolist()
+        counts_list = counts.tolist()
         for i in range(self.n_routed_experts):
             if counts_list[i] == 0:
                 continue
