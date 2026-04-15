@@ -334,11 +334,7 @@ class MoeRouter(nn.Module):
         self.bias_update_speed = config.bias_update_speed
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # hidden_states: (batch_size, seq_len, hidden_size)
-        bsz, seq_len, _ = hidden_states.shape
-        hidden_states = hidden_states.view(
-            bsz * seq_len, -1
-        )  # (bsz*seq_len, hidden_size)
+        # hidden_states: (bsz*seq_len, hidden_size)
 
         # 计算路由分数
         scores = nn.functional.linear(
