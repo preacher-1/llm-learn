@@ -42,7 +42,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
         attention_mask = data["attention_mask"].to(args.device)
 
         last_step = step
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.lr)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -61,7 +61,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
             scaler.unscale_(optimizer)
 
             # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
@@ -73,7 +73,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.gradient_accumulation_steps
             current_lr = optimizer.param_groups[0]["lr"]
-            eta_min = spend_time * (iters - step) / max(1, step - start_step) // 60
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}] Step [{step}/{iters}] Loss: {current_loss:.4f} LR: {current_lr:.2e} epoch_time: {eta_min:.1f}min"
             )
@@ -87,7 +87,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
                     step=epoch * iters + step,
                 )
 
-        if (step % args.eval_interval == 0 or step == iters) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = "_moe" if model_config.use_moe else ""
             ckpt = f"{args.save_dir}/{args.save_weight}_{model_config.hidden_dim}{moe_suffix}_epoch{epoch + 1}_step{step}.pt"
@@ -119,7 +119,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
 
         if last_step > start_step and last_step % args.gradient_accumulation_steps != 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
