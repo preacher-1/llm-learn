@@ -68,6 +68,18 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
 
             optimizer.zero_grad()
 
+            if model_config.use_moe:
+                # 获取底层原始模型 (处理 DDP 包装的情况)
+                raw_model = (
+                    model.module
+                    if isinstance(model, torch.nn.parallel.DistributedDataParallel)
+                    else model
+                )
+                # 遍历所有模块，找到带有 update_bias 方法的 MoeRouter 并触发更新
+                for module in raw_model.modules():
+                    if hasattr(module, "update_bias") and callable(module.update_bias):
+                        module.update_bias()
+
         # logging、评估与保存
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -123,6 +135,16 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+
+            if model_config.use_moe:
+                raw_model = (
+                    model.module
+                    if isinstance(model, torch.nn.parallel.DistributedDataParallel)
+                    else model
+                )
+                for module in raw_model.modules():
+                    if hasattr(module, "update_bias") and callable(module.update_bias):
+                        module.update_bias()
 
 
 if __name__ == "__main__":
