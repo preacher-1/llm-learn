@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 from typing import Optional, Tuple, List, Union
 from transformers import PretrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.activations import ACT2FN
@@ -77,10 +79,6 @@ class MyModelConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
-
-
-import torch
-import torch.nn as nn
 
 
 class RMSNorm(nn.Module):
@@ -237,7 +235,7 @@ class Attention(nn.Module):
         value = repeat_kv(value, self.n_rep)
 
         if self.flash and (seq_len > 1) and (past_key_values is None):
-            if attention_mask is None or torch.all(attention_mask == 1):
+            if attention_mask is None:
                 # 直接使用原生 Causal 加速 (此时性能最高，可触发纯正 FlashAttention)
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
                     query, key, value, attn_mask=None, is_causal=True
@@ -319,8 +317,9 @@ class MoeRouter(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
 
         self.weight = nn.Parameter(
-            torch.randn(self.n_routed_experts, config.hidden_size)
+            torch.empty(self.n_routed_experts, config.hidden_size)
         )  # (n_routed_experts, hidden_size)
+        nn.init.normal_(self.weight, std=0.001)
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.n_routed_experts, dtype=torch.float32),
@@ -524,6 +523,7 @@ class MyModel(nn.Module):
         # past_key_values: 若干层的tuple组成的list，每层是tuple[key, value]
         bsz, seq_len = input_ids.shape
 
+        # TODO: 实现正确的past_key_values兼容逻辑
         # 兼容hf transformers
         if hasattr(past_key_values, "layers"):
             past_key_values = None
