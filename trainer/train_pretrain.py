@@ -153,22 +153,22 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
 
         del input_ids, labels, attention_mask, outputs, loss
 
-        if last_step > start_step and last_step % args.gradient_accumulation_steps != 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+    if last_step > start_step and last_step % args.gradient_accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
 
-            if model_config.use_moe:
-                raw_model = (
-                    model.module
-                    if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-                    else model
-                )
-                for module in raw_model.modules():
-                    if hasattr(module, "update_bias") and callable(module.update_bias):
-                        module.update_bias()
+        if model_config.use_moe:
+            raw_model = (
+                model.module
+                if isinstance(model, torch.nn.parallel.DistributedDataParallel)
+                else model
+            )
+            for module in raw_model.modules():
+                if hasattr(module, "update_bias") and callable(module.update_bias):
+                    module.update_bias()
 
 
 if __name__ == "__main__":
