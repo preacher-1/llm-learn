@@ -13,8 +13,8 @@ class MyModelConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: int = 1365,  # 512*8/3
+        hidden_size: int = 768,
+        intermediate_size: int = 2048,  # 768*8/3
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -27,12 +27,12 @@ class MyModelConfig(PretrainedConfig):
         flash_attention: bool = True,
         ############ MoE ############
         use_moe: bool = True,
-        num_experts_per_tok: int = 2,  # 每个token路由到的专家数量
+        num_experts_per_tok: int = 4,  # 每个token路由到的专家数量
         first_k_dense_replace: int = 1,  # 从第几层开始用MoE替换FFN
-        n_routed_experts: int = 8,  # 总的路由专家数量
+        n_routed_experts: int = 16,  # 总的路由专家数量
         n_shared_experts: int = 1,  # 共享专家数量
-        routed_scaling_factor: float = 1.4,
-        moe_intermediate_size: Optional[int] = None,  # MoE层的intermediate_size，如果为None则在类中计算
+        routed_scaling_factor: float = 2.0,
+        moe_intermediate_size: Optional[int] = 410,  # MoE层的intermediate_size，如果为None则在类中计算
         bias_update_speed: float = 0.001,  # 路由分数偏置的更新速度
         norm_topk_prob: bool = True,
         **kwargs,
