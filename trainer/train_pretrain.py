@@ -108,9 +108,6 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
             raw_model = (
                 model.module if isinstance(model, DistributedDataParallel) else model
             )
-            raw_model = getattr(
-                raw_model, "model", raw_model
-            )  # 如果是包装了模型的分布式数据并行，获取原始模型
 
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckpt)
@@ -219,7 +216,7 @@ if __name__ == "__main__":
     resume_ckpt = None
     if args.from_resume:
         resume_ckpt = lm_checkpoint(
-            lm_config=model_config,
+            model_config=model_config,
             weight=args.from_weight,
             save_dir="../checkpoints",
         )
